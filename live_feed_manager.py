@@ -16,6 +16,14 @@ PERSIST_SECONDS = 15
 
 
 # -----------------------------
+# GLOBAL SAFETY LOCKS
+# prevents duplicate engine starts
+# -----------------------------
+_engine_lock = threading.Lock()
+_engine_started = False
+
+
+# -----------------------------
 # ASYNC WRAPPER
 # -----------------------------
 def _run_async_task(coro):
@@ -52,36 +60,54 @@ def _persist_loop():
 
 # -----------------------------
 # MAIN STARTER
+# starts ONLY ONCE
 # -----------------------------
 def start_live_feed_manager():
-    # STOCK FEED
-    stock_thread = threading.Thread(
-        target=_run_async_task,
-        args=(run_stocks_feed(),),
-        daemon=True,
-    )
+    global _engine_started
 
-    # OPTIONS FEED
-    options_thread = threading.Thread(
-        target=_run_async_task,
-        args=(run_options_feed(),),
-        daemon=True,
-    )
+    with _engine_lock:
+        if _engine_started:
+            print("✅ Live feed manager already running. Skipping duplicate start.")
+            return
 
-    # BACKEND REFRESH THREAD
-    backend_thread = threading.Thread(
-        target=_backend_refresh_loop,
-        daemon=True,
-    )
+        print("🚀 Starting live feed manager...")
 
-    # PERSISTENCE THREAD
-    persist_thread = threading.Thread(
-        target=_persist_loop,
-        daemon=True,
-    )
+        # STOCK FEED THREAD
+        stock_thread = threading.Thread(
+            target=_run_async_task,
+            args=(run_stocks_feed(),),
+            daemon=True,
+            name="stocks-feed-thread",
+        )
 
-    # START EVERYTHING
-    stock_thread.start()
-    options_thread.start()
-    backend_thread.start()
-    persist_thread.start()
+        # OPTIONS FEED THREAD
+        options_thread = threading.Thread(
+            target=_run_async_task,
+            args=(run_options_feed(),),
+            daemon=True,
+            name="options-feed-thread",
+        )
+
+        # BACKEND REFRESH THREAD
+        backend_thread = threading.Thread(
+            target=_backend_refresh_loop,
+            daemon=True,
+            name="backend-refresh-thread",
+        )
+
+        # PERSISTENCE THREAD
+        persist_thread = threading.Thread(
+            target=_persist_loop,
+            daemon=True,
+            name="persist-thread",
+        )
+
+        # START EVERYTHING ONLY ONE TIME
+        stock_thread.start()
+        options_thread.start()
+        backend_thread.start()
+        persist_thread.start()
+
+        _engine_started = True
+
+        print("✅ Live feed manager started successfully.")

@@ -1,33 +1,42 @@
+import threading
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
 from config import WATCHLIST
 from data_store import get_display_data, last_backend_refresh_utc
+from live_feed_manager import start_live_feed_manager
 
 st.set_page_config(layout="wide", page_title="Chart")
 
 st.title("Institutional Chart")
 
+
+# -----------------------------
+# START LIVE ENGINE (SAFE)
+# -----------------------------
+def ensure_data_engine_running():
+    if "engine_started" not in st.session_state:
+        st.session_state.engine_started = False
+
+    if not st.session_state.engine_started:
+        try:
+            thread = threading.Thread(
+                target=start_live_feed_manager,
+                daemon=True,
+                name="chart-live-feed-manager",
+            )
+            thread.start()
+            st.session_state.engine_started = True
+            print("✅ Chart requested live feed manager start.")
+        except Exception as e:
+            print(f"[Chart Engine Start Error] {e}")
+
+
+ensure_data_engine_running()
+
 selected = st.selectbox("Select ticker", WATCHLIST, key="chart_ticker")
 timeframe = st.selectbox("Timeframe", ["1m", "5m", "15m", "1h", "4h", "1D"], index=1)
-
-data = get_display_data(selected)
-
-spot = float(data.get("price", 0.0) or 0.0)
-support = float(data.get("support", 0.0) or 0.0)
-resistance = float(data.get("resistance", 0.0) or 0.0)
-
-delta_walls = list(data.get("delta_walls", []) or [])
-gamma_zones = list(data.get("gamma_zones", []) or [])
-big_trades = list(data.get("big_trades", []) or [])
-signal_summary = data.get("signal_summary", {}) or {}
-options_bias = str(data.get("options_bias", "NEUTRAL") or "NEUTRAL")
-tier_stats = data.get("tier_stats", {}) or {}
-
-signal_direction = str(signal_summary.get("direction", "NEUTRAL") or "NEUTRAL")
-signal_confidence = int(signal_summary.get("confidence", 0) or 0)
-signal_reason = str(signal_summary.get("reason", "Not enough data yet.") or "Not enough data yet.")
 
 
 def candles_to_df(candles):
@@ -370,381 +379,495 @@ def price_band_halfwidth(strike):
     return max(strike * 0.0012, 0.4)
 
 
-candles_df = candles_to_df(data.get("candles", []))
-chart_df = resample_candles(candles_df, timeframe)
+def wall_zone_halfwidth(strike, premium, is_key=False):
+    base = max(strike * 0.0015, 0.6)
+    if premium > 500000:
+        base *= 1.5
+    elif premium > 150000:
+        base *= 1.25
+    if is_key:
+        base *= 1.2
+    return base
 
-above_wall, below_wall, strongest_wall, nearest_wall = nearest_wall_info(delta_walls, spot)
-plot_walls = select_clean_walls(delta_walls, spot)
-plot_gamma_zones = select_clean_gamma_zones(gamma_zones, spot)
 
-trade_plan = build_trade_plan(spot, above_wall, below_wall, signal_direction)
-wall_pressure = get_wall_pressure(spot, above_wall, below_wall)
-breakout_state = get_breakout_state(spot, above_wall, below_wall)
-tier_label, tier_sub = get_tier_pressure(tier_stats)
-price_location_label, price_location_sub = get_price_location(spot, above_wall, below_wall)
+def wall_zone_style(bias_text):
+    bias_norm = normalize_bias_text(bias_text)
+    if bias_norm == "BULLISH":
+        return "rgba(34,197,94,0.18)"
+    if bias_norm == "BEARISH":
+        return "rgba(239,68,68,0.18)"
+    return "rgba(148,163,184,0.12)"
 
-setup = signal_summary.get("setup", signal_direction)
-trigger = signal_summary.get("reason", "Watching levels")
 
-# -----------------------------
-# HEADER METRICS
-# -----------------------------
-m1, m2, m3, m4, m5 = st.columns(5)
+@st.fragment(run_every="1s")
+def render_chart_page():
+    data = get_display_data(selected)
 
-with m1:
-    st.metric("Spot", f"{spot:,.2f}")
+    spot = float(data.get("price", 0.0) or 0.0)
+    support = float(data.get("support", 0.0) or 0.0)
+    resistance = float(data.get("resistance", 0.0) or 0.0)
 
-with m2:
-    st.metric("Signal", signal_direction)
+    delta_walls = list(data.get("delta_walls", []) or [])
+    gamma_zones = list(data.get("gamma_zones", []) or [])
+    big_trades = list(data.get("big_trades", []) or [])
+    signal_summary = data.get("signal_summary", {}) or {}
+    options_bias = str(data.get("options_bias", "NEUTRAL") or "NEUTRAL")
+    tier_stats = data.get("tier_stats", {}) or {}
 
-with m3:
-    st.metric("Confidence", f"{signal_confidence}%")
+    signal_direction = str(signal_summary.get("direction", "NEUTRAL") or "NEUTRAL")
+    signal_confidence = int(signal_summary.get("confidence", 0) or 0)
+    signal_reason = str(signal_summary.get("reason", "Not enough data yet.") or "Not enough data yet.")
 
-with m4:
-    st.metric("Options Bias", options_bias)
+    candles_df = candles_to_df(data.get("candles", []))
+    chart_df = resample_candles(candles_df, timeframe)
 
-with m5:
-    if strongest_wall:
-        st.metric(
-            "Strongest Wall",
-            f"{float(strongest_wall['strike']):.2f}",
-            f"${float(strongest_wall.get('total_premium', 0.0) or 0.0):,.0f}",
+    above_wall, below_wall, strongest_wall, nearest_wall = nearest_wall_info(delta_walls, spot)
+    plot_walls = select_clean_walls(delta_walls, spot)
+    plot_gamma_zones = select_clean_gamma_zones(gamma_zones, spot)
+
+    trade_plan = build_trade_plan(spot, above_wall, below_wall, signal_direction)
+    wall_pressure = get_wall_pressure(spot, above_wall, below_wall)
+    breakout_state = get_breakout_state(spot, above_wall, below_wall)
+    tier_label, tier_sub = get_tier_pressure(tier_stats)
+    price_location_label, price_location_sub = get_price_location(spot, above_wall, below_wall)
+
+    setup = signal_summary.get("setup", signal_direction)
+    trigger = signal_summary.get("reason", "Watching levels")
+
+    # -----------------------------
+    # HEADER METRICS
+    # -----------------------------
+    m1, m2, m3, m4, m5 = st.columns(5)
+
+    with m1:
+        st.metric("Spot", f"{spot:,.2f}")
+
+    with m2:
+        st.metric("Signal", signal_direction)
+
+    with m3:
+        st.metric("Confidence", f"{signal_confidence}%")
+
+    with m4:
+        st.metric("Options Bias", options_bias)
+
+    with m5:
+        if strongest_wall:
+            st.metric(
+                "Strongest Wall",
+                f"{float(strongest_wall['strike']):.2f}",
+                f"${float(strongest_wall.get('total_premium', 0.0) or 0.0):,.0f}",
+            )
+        else:
+            st.metric("Strongest Wall", "N/A")
+
+    st.write(f"**Reason:** {signal_reason}")
+    st.write(f"**Setup:** {setup}")
+    st.write(f"**Trigger:** {trigger}")
+
+    # -----------------------------
+    # STATUS CHIPS
+    # -----------------------------
+    st.subheader("Live Status")
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+
+    with c1:
+        render_status_chip(
+            breakout_state,
+            f"Spot {spot:.2f}",
         )
+
+    with c2:
+        render_status_chip(
+            wall_pressure,
+            (
+                f"Above: {float(above_wall.get('strike', 0) or 0):.2f} | "
+                f"Below: {float(below_wall.get('strike', 0) or 0):.2f}"
+            ) if (above_wall and below_wall) else "Wall structure still building",
+        )
+
+    with c3:
+        render_status_chip(
+            f"{normalize_bias_text(options_bias)} OPTIONS FLOW",
+            f"Signal {signal_direction} | Confidence {signal_confidence}%",
+        )
+
+    with c4:
+        render_status_chip(tier_label, tier_sub)
+
+    with c5:
+        render_status_chip(price_location_label, price_location_sub)
+
+    st.divider()
+
+    # -----------------------------
+    # LIVE WALL SUMMARY
+    # -----------------------------
+    st.subheader("Live Wall Summary")
+
+    w1, w2, w3, w4 = st.columns(4)
+
+    with w1:
+        if above_wall:
+            st.metric(
+                "Wall Above",
+                f"{float(above_wall['strike']):.2f}",
+                f"{above_wall.get('bias', 'N/A')} | {float(above_wall.get('strike', 0) or 0) - spot:+.2f}",
+            )
+        else:
+            st.metric("Wall Above", "N/A")
+
+    with w2:
+        if below_wall:
+            st.metric(
+                "Wall Below",
+                f"{float(below_wall['strike']):.2f}",
+                f"{below_wall.get('bias', 'N/A')} | {spot - float(below_wall.get('strike', 0) or 0):+.2f}",
+            )
+        else:
+            st.metric("Wall Below", "N/A")
+
+    with w3:
+        if nearest_wall:
+            nearest_dist = float(nearest_wall.get("strike", 0) or 0) - spot
+            st.metric(
+                "Nearest Wall",
+                f"{float(nearest_wall['strike']):.2f}",
+                f"{nearest_dist:+.2f}",
+            )
+        else:
+            st.metric("Nearest Wall", "N/A")
+
+    with w4:
+        if support > 0 and resistance > 0:
+            st.metric("Range", f"{support:.2f} - {resistance:.2f}", f"{(resistance - support):.2f}")
+        else:
+            st.metric("Range", "N/A")
+
+    st.write(f"**Trade Plan:** {trade_plan}")
+
+    st.divider()
+
+    # -----------------------------
+    # CHART
+    # -----------------------------
+    st.subheader("Price Chart")
+
+    if chart_df.empty:
+        st.info("No candle data yet.")
     else:
-        st.metric("Strongest Wall", "N/A")
+        fig = go.Figure()
 
-st.write(f"**Reason:** {signal_reason}")
-st.write(f"**Setup:** {setup}")
-st.write(f"**Trigger:** {trigger}")
-
-# -----------------------------
-# STATUS CHIPS
-# -----------------------------
-st.subheader("Live Status")
-
-c1, c2, c3, c4, c5 = st.columns(5)
-
-with c1:
-    render_status_chip(
-        breakout_state,
-        f"Spot {spot:.2f}",
-    )
-
-with c2:
-    render_status_chip(
-        wall_pressure,
-        (
-            f"Above: {float(above_wall.get('strike', 0) or 0):.2f} | "
-            f"Below: {float(below_wall.get('strike', 0) or 0):.2f}"
-        ) if (above_wall and below_wall) else "Wall structure still building",
-    )
-
-with c3:
-    render_status_chip(
-        f"{normalize_bias_text(options_bias)} OPTIONS FLOW",
-        f"Signal {signal_direction} | Confidence {signal_confidence}%",
-    )
-
-with c4:
-    render_status_chip(tier_label, tier_sub)
-
-with c5:
-    render_status_chip(price_location_label, price_location_sub)
-
-st.divider()
-
-# -----------------------------
-# LIVE WALL SUMMARY
-# -----------------------------
-st.subheader("Live Wall Summary")
-
-w1, w2, w3, w4 = st.columns(4)
-
-with w1:
-    if above_wall:
-        st.metric(
-            "Wall Above",
-            f"{float(above_wall['strike']):.2f}",
-            f"{above_wall.get('bias', 'N/A')} | {float(above_wall.get('strike', 0) or 0) - spot:+.2f}",
-        )
-    else:
-        st.metric("Wall Above", "N/A")
-
-with w2:
-    if below_wall:
-        st.metric(
-            "Wall Below",
-            f"{float(below_wall['strike']):.2f}",
-            f"{below_wall.get('bias', 'N/A')} | {spot - float(below_wall.get('strike', 0) or 0):+.2f}",
-        )
-    else:
-        st.metric("Wall Below", "N/A")
-
-with w3:
-    if nearest_wall:
-        nearest_dist = float(nearest_wall.get("strike", 0) or 0) - spot
-        st.metric(
-            "Nearest Wall",
-            f"{float(nearest_wall['strike']):.2f}",
-            f"{nearest_dist:+.2f}",
-        )
-    else:
-        st.metric("Nearest Wall", "N/A")
-
-with w4:
-    if support > 0 and resistance > 0:
-        st.metric("Range", f"{support:.2f} - {resistance:.2f}", f"{(resistance - support):.2f}")
-    else:
-        st.metric("Range", "N/A")
-
-st.write(f"**Trade Plan:** {trade_plan}")
-
-st.divider()
-
-# -----------------------------
-# CHART
-# -----------------------------
-st.subheader("Price Chart")
-
-if chart_df.empty:
-    st.info("No candle data yet.")
-else:
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Candlestick(
-            x=chart_df["timestamp"],
-            open=chart_df["open"],
-            high=chart_df["high"],
-            low=chart_df["low"],
-            close=chart_df["close"],
-            name="Price",
-        )
-    )
-
-    last_ts = chart_df["timestamp"].iloc[-1]
-
-    if spot > 0:
-        fig.add_hline(
-            y=spot,
-            line_width=2,
-            line_dash="dot",
-            annotation_text=f"Spot {spot:.2f}",
-            annotation_position="top left",
+        fig.add_trace(
+            go.Candlestick(
+                x=chart_df["timestamp"],
+                open=chart_df["open"],
+                high=chart_df["high"],
+                low=chart_df["low"],
+                close=chart_df["close"],
+                name="Price",
+            )
         )
 
-    if support > 0:
-        fig.add_hline(
-            y=support,
-            line_width=1,
-            line_dash="dash",
-            annotation_text=f"Support {support:.2f}",
-            annotation_position="bottom left",
-        )
+        last_ts = chart_df["timestamp"].iloc[-1]
 
-    if resistance > 0:
-        fig.add_hline(
-            y=resistance,
-            line_width=1,
-            line_dash="dash",
-            annotation_text=f"Resistance {resistance:.2f}",
-            annotation_position="top left",
-        )
+        # Extend x-range slightly so live annotations have room
+        x_min = chart_df["timestamp"].min()
+        x_max = chart_df["timestamp"].max()
+        if pd.notna(x_min) and pd.notna(x_max):
+            extra = max((x_max - x_min) * 0.04, pd.Timedelta(minutes=2))
+            fig.update_xaxes(range=[x_min, x_max + extra])
 
-    for wall in plot_walls:
-        strike = float(wall.get("strike", 0.0) or 0.0)
-        bias = str(wall.get("bias", "WALL") or "WALL")
-        total_premium = float(wall.get("total_premium", 0.0) or 0.0)
+        # Shaded wall zones
+        for wall in plot_walls:
+            strike = float(wall.get("strike", 0.0) or 0.0)
+            bias = str(wall.get("bias", "WALL") or "WALL")
+            total_premium = float(wall.get("total_premium", 0.0) or 0.0)
 
-        if strike > 0:
+            if strike <= 0:
+                continue
+
             is_key = (
                 (nearest_wall and float(nearest_wall.get("strike", 0) or 0) == strike) or
                 (strongest_wall and float(strongest_wall.get("strike", 0) or 0) == strike)
             )
 
+            half = wall_zone_halfwidth(strike, total_premium, is_key=is_key)
+            zone_fill = wall_zone_style(bias)
+
+            fig.add_hrect(
+                y0=strike - half,
+                y1=strike + half,
+                line_width=0,
+                fillcolor=zone_fill,
+                opacity=0.22 if is_key else 0.14,
+                annotation_text=f"{bias} wall {strike:.2f}",
+                annotation_position="top left",
+            )
+
             fig.add_hline(
                 y=strike,
-                line_width=2.5 if is_key else 1.2,
+                line_width=2.4 if is_key else 1.2,
                 line_dash="dot",
                 annotation_text=f"{bias} {strike:.2f} | ${total_premium:,.0f}",
                 annotation_position="right",
             )
 
-    for zone in plot_gamma_zones:
-        strike = float(zone.get("strike", 0.0) or 0.0)
-        strength = float(zone.get("zone_strength", 0.0) or 0.0)
+        # Gamma zones
+        for zone in plot_gamma_zones:
+            strike = float(zone.get("strike", 0.0) or 0.0)
+            strength = float(zone.get("zone_strength", 0.0) or 0.0)
 
-        if strike > 0:
-            band_half = price_band_halfwidth(strike)
-            fig.add_hrect(
-                y0=strike - band_half,
-                y1=strike + band_half,
-                line_width=0,
-                annotation_text=f"Gamma {strike:.2f}",
+            if strike > 0:
+                band_half = price_band_halfwidth(strike)
+                fig.add_hrect(
+                    y0=strike - band_half,
+                    y1=strike + band_half,
+                    line_width=0,
+                    annotation_text=f"Gamma {strike:.2f}",
+                    annotation_position="top left",
+                    opacity=0.10 if strength <= 0 else min(0.22, max(0.08, strength / 100000)),
+                )
+
+        # Support / resistance
+        if support > 0:
+            fig.add_hline(
+                y=support,
+                line_width=1,
+                line_dash="dash",
+                annotation_text=f"Support {support:.2f}",
+                annotation_position="bottom left",
+            )
+
+        if resistance > 0:
+            fig.add_hline(
+                y=resistance,
+                line_width=1,
+                line_dash="dash",
+                annotation_text=f"Resistance {resistance:.2f}",
                 annotation_position="top left",
-                opacity=0.10 if strength <= 0 else min(0.22, max(0.08, strength / 100000)),
             )
 
-    if spot > 0 and above_wall:
-        above_strike = float(above_wall.get("strike", 0) or 0)
-        if spot > above_strike:
+        # Live spot
+        if spot > 0:
+            fig.add_hline(
+                y=spot,
+                line_width=2,
+                line_dash="dot",
+                annotation_text=f"Live Spot {spot:.2f}",
+                annotation_position="top left",
+            )
+
+            fig.add_trace(
+                go.Scatter(
+                    x=[last_ts],
+                    y=[spot],
+                    mode="markers+text",
+                    name="Live Spot",
+                    text=[f"{spot:.2f}"],
+                    textposition="middle right",
+                    marker=dict(size=10, symbol="circle"),
+                )
+            )
+
+        # Breakout / breakdown annotations
+        if spot > 0 and above_wall:
+            above_strike = float(above_wall.get("strike", 0) or 0)
+            if spot > above_strike:
+                fig.add_annotation(
+                    x=last_ts,
+                    y=spot,
+                    text=f"BREAKOUT > {above_strike:.2f}",
+                    showarrow=True,
+                    arrowhead=2,
+                    ax=-90,
+                    ay=-40,
+                    bgcolor="rgba(34,197,94,0.20)",
+                    borderpad=6,
+                )
+
+        if spot > 0 and below_wall:
+            below_strike = float(below_wall.get("strike", 0) or 0)
+            if spot < below_strike:
+                fig.add_annotation(
+                    x=last_ts,
+                    y=spot,
+                    text=f"BREAKDOWN < {below_strike:.2f}",
+                    showarrow=True,
+                    arrowhead=2,
+                    ax=-90,
+                    ay=40,
+                    bgcolor="rgba(239,68,68,0.20)",
+                    borderpad=6,
+                )
+
+        if spot > 0 and above_wall and below_wall:
+            above_strike = float(above_wall.get("strike", 0) or 0)
+            below_strike = float(below_wall.get("strike", 0) or 0)
+            if below_strike < spot < above_strike:
+                fig.add_annotation(
+                    x=last_ts,
+                    y=spot,
+                    text=f"INSIDE WALLS {below_strike:.2f} - {above_strike:.2f}",
+                    showarrow=False,
+                    yshift=26,
+                    bgcolor="rgba(148,163,184,0.15)",
+                    borderpad=6,
+                )
+
+        if spot > 0 and nearest_wall:
+            nearest_strike = float(nearest_wall.get("strike", 0) or 0)
+            direction_text = "Pressure Up" if nearest_strike > spot else "Pressure Down"
             fig.add_annotation(
                 x=last_ts,
-                y=spot,
-                text=f"BREAKOUT > {above_strike:.2f}",
+                y=nearest_strike,
+                text=f"{direction_text} → {nearest_strike:.2f}",
                 showarrow=True,
-                arrowhead=2,
-                ax=-90,
-                ay=-40,
-                bgcolor="rgba(34,197,94,0.20)",
-                borderpad=6,
+                arrowhead=1,
+                ax=-80,
+                ay=-20 if nearest_strike > spot else 20,
+                bgcolor="rgba(59,130,246,0.16)",
+                borderpad=5,
             )
 
-    if spot > 0 and below_wall:
-        below_strike = float(below_wall.get("strike", 0) or 0)
-        if spot < below_strike:
-            fig.add_annotation(
-                x=last_ts,
-                y=spot,
-                text=f"BREAKDOWN < {below_strike:.2f}",
-                showarrow=True,
-                arrowhead=2,
-                ax=-90,
-                ay=40,
-                bgcolor="rgba(239,68,68,0.20)",
-                borderpad=6,
+        # Big trade markers
+        markers = build_big_trade_markers(big_trades)
+
+        buy_x, buy_y = markers["buy"]
+        if buy_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=buy_x,
+                    y=buy_y,
+                    mode="markers",
+                    name="Big Buy",
+                    marker=dict(symbol="triangle-up", size=10),
+                )
             )
 
-    if spot > 0 and above_wall and below_wall:
-        above_strike = float(above_wall.get("strike", 0) or 0)
-        below_strike = float(below_wall.get("strike", 0) or 0)
-        if below_strike < spot < above_strike:
-            fig.add_annotation(
-                x=last_ts,
-                y=spot,
-                text=f"INSIDE WALLS {below_strike:.2f} - {above_strike:.2f}",
-                showarrow=False,
-                yshift=26,
-                bgcolor="rgba(148,163,184,0.15)",
-                borderpad=6,
+        sell_x, sell_y = markers["sell"]
+        if sell_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=sell_x,
+                    y=sell_y,
+                    mode="markers",
+                    name="Big Sell",
+                    marker=dict(symbol="triangle-down", size=10),
+                )
             )
 
-    if spot > 0 and nearest_wall:
-        nearest_strike = float(nearest_wall.get("strike", 0) or 0)
-        direction_text = "Pressure Up" if nearest_strike > spot else "Pressure Down"
-        fig.add_annotation(
-            x=last_ts,
-            y=nearest_strike,
-            text=f"{direction_text} → {nearest_strike:.2f}",
-            showarrow=True,
-            arrowhead=1,
-            ax=-80,
-            ay=-20 if nearest_strike > spot else 20,
-            bgcolor="rgba(59,130,246,0.16)",
-            borderpad=5,
+        unknown_x, unknown_y = markers["unknown"]
+        if unknown_x:
+            fig.add_trace(
+                go.Scatter(
+                    x=unknown_x,
+                    y=unknown_y,
+                    mode="markers",
+                    name="Big Unknown",
+                    marker=dict(symbol="circle", size=8),
+                )
+            )
+
+        # Make sure live spot and wall zones stay visible even if candles are stale
+        y_values = []
+        for col in ["low", "high", "open", "close"]:
+            if col in chart_df.columns:
+                y_values.extend(pd.to_numeric(chart_df[col], errors="coerce").dropna().tolist())
+
+        if spot > 0:
+            y_values.append(spot)
+        if support > 0:
+            y_values.append(support)
+        if resistance > 0:
+            y_values.append(resistance)
+
+        for wall in plot_walls:
+            strike = float(wall.get("strike", 0.0) or 0.0)
+            premium = float(wall.get("total_premium", 0.0) or 0.0)
+            if strike > 0:
+                half = wall_zone_halfwidth(strike, premium)
+                y_values.extend([strike - half, strike + half])
+
+        for zone in plot_gamma_zones:
+            strike = float(zone.get("strike", 0.0) or 0.0)
+            if strike > 0:
+                half = price_band_halfwidth(strike)
+                y_values.extend([strike - half, strike + half])
+
+        if y_values:
+            y_min = min(y_values)
+            y_max = max(y_values)
+            pad = max((y_max - y_min) * 0.08, 1.0)
+            fig.update_yaxes(range=[y_min - pad, y_max + pad])
+
+        fig.update_layout(
+            height=720,
+            xaxis_rangeslider_visible=False,
+            legend=dict(orientation="h"),
+            margin=dict(l=20, r=20, t=40, b=20),
         )
 
-    markers = build_big_trade_markers(big_trades)
+        st.plotly_chart(fig, width="stretch")
 
-    buy_x, buy_y = markers["buy"]
-    if buy_x:
-        fig.add_trace(
-            go.Scatter(
-                x=buy_x,
-                y=buy_y,
-                mode="markers",
-                name="Big Buy",
-                marker=dict(symbol="triangle-up", size=10),
-            )
+    st.divider()
+
+    # -----------------------------
+    # TABLES UNDER CHART
+    # -----------------------------
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader("Key Delta Walls")
+
+        if plot_walls:
+            delta_walls_df = pd.DataFrame(plot_walls).copy()
+            st.dataframe(delta_walls_df, width="stretch", height=230)
+        else:
+            st.info("No delta walls yet.")
+
+    with right:
+        st.subheader("Key Gamma Zones")
+
+        if plot_gamma_zones:
+            gamma_zones_df = pd.DataFrame(plot_gamma_zones).copy()
+            st.dataframe(gamma_zones_df, width="stretch", height=230)
+        else:
+            st.info("No gamma zones yet.")
+
+    st.divider()
+
+    left2, right2 = st.columns(2)
+
+    with left2:
+        st.subheader("Recent Big Stock Trades")
+
+        if big_trades:
+            big_trades_df = pd.DataFrame(big_trades[::-1]).copy()
+
+            if "timestamp" in big_trades_df.columns:
+                big_trades_df["timestamp"] = big_trades_df["timestamp"].astype(str)
+
+            st.dataframe(big_trades_df, width="stretch", height=240)
+        else:
+            st.info("No big stock trades yet.")
+
+    with right2:
+        st.subheader("Recent Candles")
+
+        if not chart_df.empty:
+            recent_candles_df = chart_df.tail(20).copy()
+            recent_candles_df["timestamp"] = recent_candles_df["timestamp"].astype(str)
+            st.dataframe(recent_candles_df, width="stretch", height=240)
+        else:
+            st.info("No candle data yet.")
+
+    if last_backend_refresh_utc:
+        st.caption(
+            "Chart using live + sticky last-good backend data. "
+            f"Last cache refresh UTC: {last_backend_refresh_utc.strftime('%Y-%m-%d %H:%M:%S')}"
         )
 
-    sell_x, sell_y = markers["sell"]
-    if sell_x:
-        fig.add_trace(
-            go.Scatter(
-                x=sell_x,
-                y=sell_y,
-                mode="markers",
-                name="Big Sell",
-                marker=dict(symbol="triangle-down", size=10),
-            )
-        )
 
-    unknown_x, unknown_y = markers["unknown"]
-    if unknown_x:
-        fig.add_trace(
-            go.Scatter(
-                x=unknown_x,
-                y=unknown_y,
-                mode="markers",
-                name="Big Unknown",
-                marker=dict(symbol="circle", size=8),
-            )
-        )
-
-    fig.update_layout(
-        height=720,
-        xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h"),
-        margin=dict(l=20, r=20, t=40, b=20),
-    )
-
-    st.plotly_chart(fig, width="stretch")
-
-st.divider()
-
-# -----------------------------
-# TABLES UNDER CHART
-# -----------------------------
-left, right = st.columns(2)
-
-with left:
-    st.subheader("Key Delta Walls")
-
-    if plot_walls:
-        delta_walls_df = pd.DataFrame(plot_walls).copy()
-        st.dataframe(delta_walls_df, width="stretch", height=230)
-    else:
-        st.info("No delta walls yet.")
-
-with right:
-    st.subheader("Key Gamma Zones")
-
-    if plot_gamma_zones:
-        gamma_zones_df = pd.DataFrame(plot_gamma_zones).copy()
-        st.dataframe(gamma_zones_df, width="stretch", height=230)
-    else:
-        st.info("No gamma zones yet.")
-
-st.divider()
-
-left2, right2 = st.columns(2)
-
-with left2:
-    st.subheader("Recent Big Stock Trades")
-
-    if big_trades:
-        big_trades_df = pd.DataFrame(big_trades[::-1]).copy()
-
-        if "timestamp" in big_trades_df.columns:
-            big_trades_df["timestamp"] = big_trades_df["timestamp"].astype(str)
-
-        st.dataframe(big_trades_df, width="stretch", height=240)
-    else:
-        st.info("No big stock trades yet.")
-
-with right2:
-    st.subheader("Recent Candles")
-
-    if not chart_df.empty:
-        recent_candles_df = chart_df.tail(20).copy()
-        recent_candles_df["timestamp"] = recent_candles_df["timestamp"].astype(str)
-        st.dataframe(recent_candles_df, width="stretch", height=240)
-    else:
-        st.info("No candle data yet.")
-
-if last_backend_refresh_utc:
-    st.caption(
-        "Chart using live + sticky last-good backend data. "
-        f"Last cache refresh UTC: {last_backend_refresh_utc.strftime('%Y-%m-%d %H:%M:%S')}"
-    )
+render_chart_page()

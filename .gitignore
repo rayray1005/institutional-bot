@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+analytics/__pycache__/
+feeds/__pycache__/
+processors/__pycache__/

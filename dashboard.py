@@ -21,9 +21,17 @@ def ensure_data_engine_running():
         st.session_state.engine_started = False
 
     if not st.session_state.engine_started:
-        thread = threading.Thread(target=start_live_feed_manager, daemon=True)
-        thread.start()
-        st.session_state.engine_started = True
+        try:
+            thread = threading.Thread(
+                target=start_live_feed_manager,
+                daemon=True,
+                name="dashboard-live-feed-manager",
+            )
+            thread.start()
+            st.session_state.engine_started = True
+            print("✅ Dashboard requested live feed manager start.")
+        except Exception as e:
+            print(f"[Dashboard Engine Start Error] {e}")
 
 
 ensure_data_engine_running()

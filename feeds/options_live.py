@@ -36,6 +36,7 @@ async def handle_options_message(raw_message):
                 process_option_trade(event)
             except Exception as error:
                 print(f"⚠️ Option trade processing error: {error}")
+                print(f"⚠️ Bad option event: {event}")
             continue
 
 
@@ -67,16 +68,19 @@ async def run_options_feed():
 
     while True:
         try:
+            print("🔌 Connecting to OPTIONS websocket...")
+
             async with websockets.connect(
                 OPTIONS_WS_URL,
                 ping_interval=PING_INTERVAL_SECONDS,
                 ping_timeout=PING_TIMEOUT_SECONDS,
+                max_size=None,
             ) as ws:
                 await authenticate_options_socket(ws)
                 print("✅ Connected to OPTIONS feed")
 
                 await subscribe_options_socket(ws)
-                print("📡 Listening to options trades...")
+                print(f"📡 Listening to options trades: {OPTIONS_SUBSCRIPTION}")
 
                 while True:
                     raw_message = await ws.recv()
